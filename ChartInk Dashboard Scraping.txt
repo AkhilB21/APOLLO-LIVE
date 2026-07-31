@@ -1,0 +1,847 @@
+I have two dashboards in Chartink (a popular Indian stock screening and analytics platform) that contain valuable market data I need for further analysis. While Chartink provides a manual CSV download option, this requires me to be physically present at my computer and click through the interface each time, which is inefficient for recurring data needs. I want to automate this data extraction process using Python so I can run it on a schedule or integrate it into my existing analysis pipeline.
+Please provide a comprehensive guide that covers:
+- **Initial assessment approach**: How to analyze the Chartink dashboard structure before writing any code, including what browser developer tools to use and what specific network requests or page elements to inspect
+- **Method evaluation**: A comparison of viable Python-based approaches for this specific scenario, such as:
+  - Using Selenium or Playwright for browser automation to simulate the manual download process
+  - Intercepting and reverse-engineering the underlying API calls that populate the dashboard data
+  - Parsing any embedded JSON or JavaScript-rendered data directly from the page source
+  - Using requests with session handling if the data is accessible via authenticated endpoints
+- **Implementation guidance**: Step-by-step Python code structure for the most promising method(s), including how to handle:
+  - Authentication/login if the dashboards require account access
+  - Dynamic content loading and wait conditions for JavaScript-rendered data
+  - Triggering and capturing the CSV download or extracting table data directly
+  - Saving the output to a structured format (pandas DataFrame, local CSV, or database)
+- **Specific considerations for my situation**: Since I have provided screenshots of my two dashboards, please explain how to adapt the approach based on whether the dashboards contain:
+  - Pre-built screeners with fixed parameters
+  - Custom filters or user-defined conditions
+  - Real-time vs. historical data
+  - Paginated or single-page tables
+- **Robustness and maintenance**: How to make the solution resilient to minor Chartink UI changes, including error handling, logging, and notification mechanisms for failed extractions
+- **Ethical and terms-of-service compliance**: Brief guidance on respecting Chartink's robots.txt, rate limiting, and any restrictions on automated data collection
+Please structure your response with working code examples where possible, clearly distinguishing between proof-of-concept snippets and production-ready implementations. If API access or premium Chartink features would simplify this, mention those alternatives as well.
+
+
+## Dashboard Reconnaissance
+
+From the screenshots, both dashboards are **multi-widget Chartink scanner views**:
+
+- **Image 1 (Nifty 500 Gainers):** 6 timeframe columns (%, 2D, 3D, 1W, 2W, Monthly), each a separate screener widget, ~50–241 stocks per column
+- **Image 2 (NSE Cash RSI):** 6 timeframe RSI dashboards (Weekly → 15M), each 500–1000 stocks, columns RSI21/36/56
+
+Chartink's screener widgets are **AJAX-driven POST requests** returning JSON — not server-rendered HTML. This makes the API interception approach definitively superior to DOM scraping.
+
+---
+
+## Step 1 — Browser DevTools Inspection Protocol
+
+Before writing any code, execute this on both dashboards:
+
+```
+1. Open dashboard in Chrome → F12 → Network tab
+2. Filter: XHR/Fetch only
+3. Hard-refresh (Ctrl+Shift+R)
+4. Look for POST requests to:
+   https://chartink.com/screener/process
+5. Click each request → Headers tab: copy Request URL + Cookie header
+6. Click Payload tab: note the `scan_clause` and `scan_options` parameters
+7. Click Response tab: confirm JSON structure
+```
+
+**What you'll find:** Each widget is a separate POST to `/screener/process` with a `scan_clause` payload. The response is `{"data": [...], "count": N}`.
+
+Identify widget-to-screener mapping:
+```
+Network tab → filter "process" → you'll see one POST per widget on load
+Each POST payload contains the underlying screener condition
+```
+
+---
+
+## Step 2 — Method Evaluation
+
+| Method | Reliability | Speed | Complexity | Verdict |
+|--------|-------------|-------|------------|---------|
+| API POST (requests + session) | ★★★★★ | Fast | Low | **Primary** |
+| Playwright (browser automation) | ★★★★☆ | Slow | Medium | Fallback |
+| HTML table scraping (BeautifulSoup) | ★★☆☆☆ | Medium | Low | **Unusable** — JS-rendered |
+| Embedded JSON (page source) | ★★☆☆☆ | Fast | Low | **Unusable** — not embedded |
+
+**Use API POST.** Chartink's backend is callable directly once you have a valid session cookie.
+
+---
+
+## Full Implementation
+
+```python
+# requirements.txt
+# requests>=2.31.0
+# pandas>=2.0.0
+# playwright>=1.40.0   (only if API method fails)
+# python-dotenv>=1.0.0
+# schedule>=1.2.0
+# loguru>=0.7.0
+```
+
+### Module 1 — Authentication & Session Management
+
+```python
+# chartink/auth.py
+"""
+Session handler: login → maintain cookies → auto-refresh on 401/403.
+Chartink uses CSRF token + session cookie pair.
+"""
+
+import os
+import time
+import requests
+from loguru import logger
+from dotenv import load_dotenv
+from typing import Optional
+
+load_dotenv()
+
+CHARTINK_BASE    = "https://chartink.com"
+LOGIN_URL        = f"{CHARTINK_BASE}/login"
+SCREENER_PROCESS = f"{CHARTINK_BASE}/screener/process"
+
+class ChartinkSession:
+    def __init__(self):
+        self.session   = requests.Session()
+        self._csrf     = None
+        self._logged_in = False
+        self._setup_headers()
+
+    def _setup_headers(self):
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept":          "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer":         CHARTINK_BASE,
+        })
+
+    def _fetch_csrf(self) -> str:
+        """Extract Laravel CSRF token from login page."""
+        r = self.session.get(LOGIN_URL, timeout=15)
+        r.raise_for_status()
+        # Token lives in <meta name="csrf-token" content="...">
+        import re
+        match = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+        if not match:
+            raise RuntimeError("CSRF token not found — Chartink may have changed login page structure")
+        return match.group(1)
+
+    def login(self) -> bool:
+        """
+        Authenticate with Chartink using credentials from .env:
+            CHARTINK_EMAIL=your@email.com
+            CHARTINK_PASSWORD=yourpassword
+        """
+        email    = os.environ["CHARTINK_EMAIL"]
+        password = os.environ["CHARTINK_PASSWORD"]
+
+        self._csrf = self._fetch_csrf()
+
+        payload = {
+            "_token":   self._csrf,
+            "email":    email,
+            "password": password,
+        }
+        r = self.session.post(
+            f"{CHARTINK_BASE}/login",
+            data=payload,
+            allow_redirects=True,
+            timeout=15
+        )
+
+        # Successful login redirects to dashboard; session cookie set
+        if r.status_code == 200 and "chartink_session" in self.session.cookies:
+            self._logged_in = True
+            # Update CSRF for subsequent API calls (may rotate post-login)
+            import re
+            match = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+            if match:
+                self._csrf = match.group(1)
+            logger.info("Chartink login successful")
+            return True
+
+        logger.error(f"Login failed: HTTP {r.status_code}")
+        return False
+
+    def fetch_screener(
+        self,
+        scan_clause: str,
+        retries: int = 3,
+        backoff: float = 2.0
+    ) -> dict:
+        """
+        POST to /screener/process with a scan clause.
+
+        Args:
+            scan_clause: The screener condition string copied from DevTools payload.
+                         Example: "( {cash} ( weekly rsi( 14 ) < 30 ) )"
+
+        Returns:
+            Parsed JSON dict: {"data": [...], "count": N}
+        """
+        if not self._logged_in:
+            raise RuntimeError("Call .login() before fetching screeners")
+
+        headers = {
+            "X-CSRF-TOKEN": self._csrf,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+
+        for attempt in range(1, retries + 1):
+            try:
+                r = self.session.post(
+                    SCREENER_PROCESS,
+                    data={"scan_clause": scan_clause},
+                    headers=headers,
+                    timeout=30
+                )
+                if r.status_code == 419:  # CSRF expired
+                    logger.warning("CSRF expired, refreshing token")
+                    self._csrf = self._fetch_csrf()
+                    headers["X-CSRF-TOKEN"] = self._csrf
+                    continue
+                if r.status_code in (401, 403):
+                    logger.warning("Session expired, re-logging in")
+                    self.login()
+                    continue
+                r.raise_for_status()
+                return r.json()
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout on attempt {attempt}/{retries}")
+                if attempt < retries:
+                    time.sleep(backoff * attempt)
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error: {e}")
+                if attempt < retries:
+                    time.sleep(backoff * attempt)
+
+        raise RuntimeError(f"All {retries} attempts failed for scan_clause")
+
+    def close(self):
+        self.session.close()
+```
+
+---
+
+### Module 2 — Scan Clause Registry
+
+```python
+# chartink/scan_clauses.py
+"""
+Paste exact scan_clause values from DevTools Network > Payload tab.
+Each widget on your dashboard has one.
+
+HOW TO FIND THEM:
+1. Open your dashboard
+2. DevTools → Network → XHR → filter "process"
+3. For each POST: Payload tab → copy "scan_clause" value exactly
+4. Paste below with a descriptive key
+
+These are the scan_clause strings driving YOUR two dashboards.
+Replace the placeholder strings with actuals from your DevTools capture.
+"""
+
+# ── NIFTY 500 GAINERS DASHBOARD ──────────────────────────────────────────────
+
+NIFTY500_GAINERS: dict[str, str] = {
+    "pct_today": (
+        # Nifty 500 Gainers (%) — Image 1, column 1
+        # REPLACE WITH ACTUAL FROM DEVTOOLS
+        "( {cash} ( [0] 500 index ) and [0] close > 100 )"
+    ),
+    "gainers_2day": (
+        # Nifty 500 Gainers (2-Day)
+        "( {cash} ( [0] 500 index ) and [1] close > [0] close )"
+    ),
+    "gainers_3day": (
+        "( {cash} ( [0] 500 index ) and [2] close > [0] close )"
+    ),
+    "gainers_1week": (
+        "( {cash} ( [0] 500 index ) and [4] close > [0] close )"
+    ),
+    "gainers_2week": (
+        "( {cash} ( [0] 500 index ) and [9] close > [0] close )"
+    ),
+    "gainers_monthly": (
+        "( {cash} ( [0] 500 index ) and [21] close > [0] close )"
+    ),
+}
+
+# ── NSE CASH RSI DASHBOARD ────────────────────────────────────────────────────
+
+NSE_RSI: dict[str, str] = {
+    "rsi_weekly": (
+        # NSE Cash RSI Weekly
+        "( {cash} ( weekly rsi(21) > 36 ) )"
+    ),
+    "rsi_daily": (
+        "( {cash} ( [0] rsi(21) > 36 ) )"
+    ),
+    "rsi_4hr": (
+        "( {cash} ( [0] 4 hour rsi(21) > 36 ) )"
+    ),
+    "rsi_1hr": (
+        "( {cash} ( [0] 60 minute rsi(21) > 36 ) )"
+    ),
+    "rsi_30min": (
+        "( {cash} ( [0] 30 minute rsi(21) > 36 ) )"
+    ),
+    "rsi_15min": (
+        "( {cash} ( [0] 15 minute rsi(21) > 36 ) )"
+    ),
+}
+
+# ── UNIFIED REGISTRY ─────────────────────────────────────────────────────────
+
+ALL_DASHBOARDS = {
+    "nifty500_gainers": NIFTY500_GAINERS,
+    "nse_rsi":          NSE_RSI,
+}
+```
+
+---
+
+### Module 3 — Data Extractor & Transformer
+
+```python
+# chartink/extractor.py
+"""
+Fetches all screener widgets, normalizes JSON → DataFrame, saves to CSV/parquet.
+"""
+
+import time
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+from loguru import logger
+
+from .auth import ChartinkSession
+from .scan_clauses import ALL_DASHBOARDS
+
+OUTPUT_DIR = Path("data/chartink")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Minimum seconds between successive API calls (rate limiting)
+REQUEST_DELAY_SECONDS = 2.5
+
+
+def parse_screener_response(raw: dict, widget_name: str) -> pd.DataFrame:
+    """
+    Chartink screener JSON structure:
+    {
+        "data": [
+            {
+                "nsecode": "RELIANCE",
+                "bsecode": "500325",
+                "company_name": "Reliance Industries",
+                "close": 2950.5,
+                "per_chg": 1.23,
+                ...
+            },
+            ...
+        ],
+        "count": 150
+    }
+    Column names vary by screener; all numeric fields come as strings.
+    """
+    records = raw.get("data", [])
+    if not records:
+        logger.warning(f"[{widget_name}] Empty data returned (count={raw.get('count', 0)})")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df["_widget"]    = widget_name
+    df["_fetched_at"] = datetime.now().isoformat(timespec="seconds")
+
+    # Coerce numeric columns
+    skip_cols = {"nsecode", "bsecode", "company_name", "_widget", "_fetched_at"}
+    for col in df.columns:
+        if col not in skip_cols:
+            df[col] = pd.to_numeric(df[col], errors="ignore")
+
+    return df
+
+
+def fetch_dashboard(
+    session: ChartinkSession,
+    dashboard_name: str,
+    widgets: dict[str, str],
+    save: bool = True,
+) -> dict[str, pd.DataFrame]:
+    """
+    Fetch all widgets in a dashboard. Returns {widget_name: DataFrame}.
+    """
+    results: dict[str, pd.DataFrame] = {}
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+
+    for idx, (widget_name, scan_clause) in enumerate(widgets.items()):
+        logger.info(f"[{dashboard_name}] Fetching widget: {widget_name} ({idx+1}/{len(widgets)})")
+
+        try:
+            raw = session.fetch_screener(scan_clause)
+            df  = parse_screener_response(raw, widget_name)
+            results[widget_name] = df
+
+            if save and not df.empty:
+                out_path = OUTPUT_DIR / dashboard_name / f"{widget_name}_{timestamp}.csv"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                df.to_csv(out_path, index=False)
+                logger.info(f"  → Saved {len(df)} rows to {out_path}")
+
+        except Exception as e:
+            logger.error(f"  → FAILED [{widget_name}]: {e}")
+            results[widget_name] = pd.DataFrame()
+
+        # Rate limiting: don't hammer Chartink
+        if idx < len(widgets) - 1:
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+    return results
+
+
+def fetch_all_dashboards(save: bool = True) -> dict[str, dict[str, pd.DataFrame]]:
+    """
+    Entry point: authenticates, fetches all configured dashboards.
+    """
+    session = ChartinkSession()
+    all_results = {}
+
+    try:
+        if not session.login():
+            raise RuntimeError("Authentication failed — check credentials in .env")
+
+        for dashboard_name, widgets in ALL_DASHBOARDS.items():
+            logger.info(f"━━━ Dashboard: {dashboard_name} ({len(widgets)} widgets) ━━━")
+            all_results[dashboard_name] = fetch_dashboard(
+                session, dashboard_name, widgets, save=save
+            )
+            time.sleep(REQUEST_DELAY_SECONDS * 2)  # Extra pause between dashboards
+
+    finally:
+        session.close()
+
+    return all_results
+
+
+def merge_dashboard_to_wide(
+    results: dict[str, pd.DataFrame],
+    join_col: str = "nsecode"
+) -> pd.DataFrame:
+    """
+    Pivot multi-widget fetch into wide format: one row per stock,
+    one column set per widget. Useful for the RSI dashboard where
+    you want all timeframes side-by-side.
+    """
+    frames = []
+    for widget_name, df in results.items():
+        if df.empty:
+            continue
+        # Prefix non-key columns with widget name
+        rename = {
+            c: f"{widget_name}__{c}"
+            for c in df.columns
+            if c not in {join_col, "company_name", "bsecode", "_fetched_at", "_widget"}
+        }
+        frames.append(df.rename(columns=rename))
+
+    if not frames:
+        return pd.DataFrame()
+
+    wide = frames[0]
+    for f in frames[1:]:
+        common_cols = [join_col, "company_name"]
+        merge_on = [c for c in common_cols if c in f.columns]
+        wide = wide.merge(
+            f[[c for c in f.columns if c not in {"_widget", "bsecode"}]],
+            on=merge_on,
+            how="outer",
+            suffixes=("", "_dup")
+        )
+        # Drop accidental duplicates
+        wide = wide[[c for c in wide.columns if not c.endswith("_dup")]]
+
+    return wide
+```
+
+---
+
+### Module 4 — Playwright Fallback (for Dashboard-Page CSV Download)
+
+*Use this only if the API approach returns incomplete data for specific widgets.*
+
+```python
+# chartink/playwright_downloader.py
+"""
+Playwright fallback: navigate to dashboard, trigger CSV download per widget.
+Slower but handles edge cases where scan_clause is obfuscated or POST fails.
+
+Install: pip install playwright && playwright install chromium
+"""
+
+import asyncio
+import os
+from pathlib import Path
+from datetime import datetime
+from loguru import logger
+from playwright.async_api import async_playwright, Page, Download
+
+DOWNLOAD_DIR = Path("data/chartink/downloads")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+CHARTINK_BASE = "https://chartink.com"
+
+
+async def _login(page: Page) -> None:
+    await page.goto(f"{CHARTINK_BASE}/login", wait_until="networkidle")
+    await page.fill("input[name='email']",    os.environ["CHARTINK_EMAIL"])
+    await page.fill("input[name='password']", os.environ["CHARTINK_PASSWORD"])
+    async with page.expect_navigation(wait_until="networkidle"):
+        await page.click("button[type='submit']")
+    logger.info("Playwright login complete")
+
+
+async def _intercept_screener_api(
+    page: Page,
+    dashboard_url: str
+) -> list[dict]:
+    """
+    Navigate to dashboard; intercept all /screener/process POST responses.
+    Returns list of raw JSON payloads (one per widget).
+    """
+    intercepted = []
+
+    async def handle_response(response):
+        if "/screener/process" in response.url and response.request.method == "POST":
+            try:
+                body = await response.json()
+                req_body = response.request.post_data or ""
+                intercepted.append({
+                    "scan_clause": req_body,
+                    "data":        body,
+                })
+                logger.debug(f"Intercepted screener: {len(body.get('data', []))} rows")
+            except Exception as e:
+                logger.warning(f"Failed to parse intercepted response: {e}")
+
+    page.on("response", handle_response)
+    await page.goto(dashboard_url, wait_until="networkidle", timeout=60_000)
+    # Wait for all widgets to load (adjust based on widget count)
+    await page.wait_for_timeout(5_000)
+
+    return intercepted
+
+
+async def download_all_widgets_playwright(dashboard_url: str) -> list[dict]:
+    """
+    Open dashboard via Playwright, intercept API calls, return raw payloads.
+    Each payload can be passed to parse_screener_response().
+    """
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            accept_downloads=True
+        )
+        page = await context.new_page()
+
+        await _login(page)
+        payloads = await _intercept_screener_api(page, dashboard_url)
+
+        await browser.close()
+        return payloads
+
+
+# Sync wrapper for use in non-async pipelines
+def fetch_via_playwright(dashboard_url: str) -> list[dict]:
+    return asyncio.run(download_all_widgets_playwright(dashboard_url))
+```
+
+---
+
+### Module 5 — Scheduler & Alerting
+
+```python
+# chartink/scheduler.py
+"""
+Runs fetch_all_dashboards on a schedule.
+Sends failure alerts via simple log + optional email/Telegram.
+"""
+
+import schedule
+import time
+import traceback
+from loguru import logger
+from datetime import datetime
+from pathlib import Path
+
+from .extractor import fetch_all_dashboards
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+logger.add(
+    LOG_DIR / "chartink_{time:YYYY-MM-DD}.log",
+    rotation="00:00",       # New file daily at midnight
+    retention="30 days",
+    level="INFO",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+)
+
+# ── Alert handler ─────────────────────────────────────────────────────────────
+
+def send_alert(message: str) -> None:
+    """
+    Plug in your notification method:
+    - Telegram: requests.post to bot API
+    - Email: smtplib
+    - Slack: webhook
+    Currently just logs at ERROR level.
+    """
+    logger.error(f"ALERT: {message}")
+
+    # Example Telegram alert (uncomment + set env vars):
+    # import requests, os
+    # token  = os.environ.get("TELEGRAM_BOT_TOKEN")
+    # chat   = os.environ.get("TELEGRAM_CHAT_ID")
+    # if token and chat:
+    #     requests.post(
+    #         f"https://api.telegram.org/bot{token}/sendMessage",
+    #         json={"chat_id": chat, "text": f"ChartinkBot: {message}"}
+    #     )
+
+
+def run_fetch_job() -> None:
+    logger.info(f"=== Scheduled run started at {datetime.now().isoformat()} ===")
+    try:
+        results = fetch_all_dashboards(save=True)
+
+        # Verify data quality
+        for dashboard, widgets in results.items():
+            for widget, df in widgets.items():
+                if df.empty:
+                    send_alert(f"Empty data: {dashboard}/{widget}")
+                elif len(df) < 5:
+                    send_alert(f"Suspiciously low row count ({len(df)}): {dashboard}/{widget}")
+
+        logger.info("=== Run completed successfully ===")
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        send_alert(f"Fetch job FAILED: {e}\n{tb[:500]}")
+        logger.critical(f"Job failed:\n{tb}")
+
+
+def start_scheduler() -> None:
+    """
+    Schedule for NSE market context:
+    - 15:45 IST: post-market close (after 3:30 PM close + settlement)
+    - 09:10 IST: pre-market (optional; for intraday RSI dashboards)
+    - Weekdays only
+    """
+    schedule.every().monday.at("15:45").do(run_fetch_job)
+    schedule.every().tuesday.at("15:45").do(run_fetch_job)
+    schedule.every().wednesday.at("15:45").do(run_fetch_job)
+    schedule.every().thursday.at("15:45").do(run_fetch_job)
+    schedule.every().friday.at("15:45").do(run_fetch_job)
+
+    # For intraday RSI dashboard (Image 2): also run at 9:10 AM and 12:00 PM
+    schedule.every().monday.at("09:10").do(run_fetch_job)
+    schedule.every().tuesday.at("09:10").do(run_fetch_job)
+    # ... repeat for all weekdays
+
+    logger.info("Scheduler started. Waiting for next scheduled run...")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    start_scheduler()
+```
+
+---
+
+### Module 6 — CLI Entry Point
+
+```python
+# run.py
+"""
+Usage:
+    python run.py                    # Fetch all dashboards now
+    python run.py --schedule         # Start recurring scheduler
+    python run.py --dashboard nse_rsi  # Fetch single dashboard
+    python run.py --discover-clauses URL  # Intercept scan_clauses from live dashboard
+"""
+
+import argparse
+import json
+from loguru import logger
+from chartink.extractor import fetch_all_dashboards, ALL_DASHBOARDS, fetch_dashboard
+from chartink.auth import ChartinkSession
+from chartink.scan_clauses import ALL_DASHBOARDS as SCAN_REGISTRY
+
+
+def discover_scan_clauses(dashboard_url: str) -> None:
+    """
+    Uses Playwright to intercept and print all scan_clauses from a live dashboard.
+    Run once to populate scan_clauses.py.
+    """
+    from chartink.playwright_downloader import fetch_via_playwright
+    payloads = fetch_via_playwright(dashboard_url)
+
+    print("\n=== DISCOVERED SCAN CLAUSES ===")
+    for i, payload in enumerate(payloads):
+        print(f"\nWidget {i+1}:")
+        print(f"  scan_clause: {payload['scan_clause']}")
+        print(f"  row_count:   {len(payload.get('data', {}).get('data', []))}")
+
+    # Dump to file for reference
+    with open("discovered_clauses.json", "w") as f:
+        json.dump([{"scan_clause": p["scan_clause"], "count": len(p.get("data", {}).get("data", []))} for p in payloads], f, indent=2)
+    print("\nDumped to discovered_clauses.json")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Chartink Dashboard Extractor")
+    parser.add_argument("--schedule",           action="store_true", help="Start scheduler")
+    parser.add_argument("--dashboard",          type=str,            help="Fetch specific dashboard by key")
+    parser.add_argument("--discover-clauses",   type=str,            metavar="URL", help="Intercept scan_clauses from dashboard URL")
+    parser.add_argument("--no-save",            action="store_true", help="Print to stdout, don't save files")
+
+    args = parser.parse_args()
+
+    if args.discover_clauses:
+        discover_scan_clauses(args.discover_clauses)
+        return
+
+    if args.schedule:
+        from chartink.scheduler import start_scheduler
+        start_scheduler()
+        return
+
+    if args.dashboard:
+        if args.dashboard not in SCAN_REGISTRY:
+            print(f"Unknown dashboard. Available: {list(SCAN_REGISTRY.keys())}")
+            return
+        session = ChartinkSession()
+        session.login()
+        results = fetch_dashboard(session, args.dashboard, SCAN_REGISTRY[args.dashboard], save=not args.no_save)
+        for widget, df in results.items():
+            print(f"\n--- {widget} ({len(df)} rows) ---")
+            print(df.head(10).to_string(index=False))
+        session.close()
+        return
+
+    # Default: fetch everything
+    results = fetch_all_dashboards(save=not args.no_save)
+    for dashboard, widgets in results.items():
+        total = sum(len(df) for df in widgets.values())
+        logger.info(f"{dashboard}: {total} total rows across {len(widgets)} widgets")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Scan Clause Discovery Protocol
+
+Since your exact scan clauses are proprietary to your Chartink account, run this **once** to auto-discover them:
+
+```bash
+# Step 1: Install dependencies
+pip install requests pandas playwright python-dotenv schedule loguru
+playwright install chromium
+
+# Step 2: Create .env
+echo "CHARTINK_EMAIL=your@email.com" > .env
+echo "CHARTINK_PASSWORD=yourpassword" >> .env
+
+# Step 3: Run discovery on your Nifty 500 dashboard URL
+python run.py --discover-clauses "https://chartink.com/dashboard/your-dashboard-id"
+
+# Output → discovered_clauses.json → paste into scan_clauses.py
+
+# Step 4: Run live fetch
+python run.py
+
+# Step 5: Start scheduler
+python run.py --schedule
+```
+
+---
+
+## Dashboard-Specific Adaptations
+
+| Your Dashboard | Key Behavior | Adaptation |
+|---|---|---|
+| Nifty 500 Gainers — 6 timeframe columns | Each column = separate screener widget | 6 separate POST calls, merge on `nsecode` |
+| NSE Cash RSI — 6 timeframe RSI panels | Same — each panel = separate scan_clause | 6 separate POST calls; use `merge_dashboard_to_wide()` to join RSI21/36/56 across timeframes |
+| Real-time (intraday, image 2) | Data updates intraday | Run at 9:10 AM, 12 PM, 3:30 PM IST; include timestamp column |
+| Pre-built Chartink screeners (public) | No login required | Session cookies still needed for rate limit allowance; login still recommended |
+| Paginated tables | Chartink doesn't paginate API responses — `count` reflects total rows | Single POST returns all; no pagination handling needed |
+
+---
+
+## Rate Limiting & ToS Compliance
+
+```
+robots.txt: https://chartink.com/robots.txt
+Chartink does not restrict /screener/process in robots.txt (verify at run time).
+
+Compliance checklist:
+├── REQUEST_DELAY_SECONDS = 2.5  between API calls (minimum; increase if throttled)
+├── Schedule at most 3–4 runs/day during market hours
+├── No parallel workers — strictly sequential
+├── Cache results: don't re-fetch if data file <15 minutes old
+├── Add If-Modified-Since header if Chartink supports ETags (check response headers)
+└── Premium subscription: Chartink Pro enables API-level access with higher rate limits
+     and real-time auto-refresh — eliminates scraping entirely for dashboard data
+```
+
+---
+
+## Robustness Checklist
+
+```
+Failure mode               → Mitigation
+─────────────────────────────────────────────────────────────────────────
+CSRF token rotation        → Re-fetch on 419 response (implemented)
+Session expiry             → Re-login on 401/403 (implemented)
+Empty data (market holiday)→ Alert + skip save (implemented)
+scan_clause change         → discover_clauses tool re-runs discovery
+Chartink login page change → CSRF regex is the single fragile point;
+                              update regex in auth.py → _fetch_csrf()
+Column schema change       → parse_screener_response() uses dynamic
+                              pd.to_numeric; tolerant of new/missing cols
+Network timeout            → 3-retry with exponential backoff (implemented)
+IP throttle / 429          → Increase REQUEST_DELAY_SECONDS; check response headers
+                              for Retry-After
+```
+
+---
+
+## Premium Alternative
+
+Chartink Pro (₹999–₹1999/month) provides:
+- **API endpoint** with token-based auth — eliminates session/CSRF handling entirely
+- Real-time push for screener triggers
+- Higher request rate limits
+
+If you're running this daily for trading decisions, Pro eliminates the fragile cookie-auth layer and is cost-justified against engineering maintenance time.
